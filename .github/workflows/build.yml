@@ -1,0 +1,214 @@
+name: CI & Release (.NET)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override version (ex: 1.4.0). Deixe em branco para auto-bump."
+        required: false
+        default: ""
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  PROJECT: src/ReCap.Unpacker/ReCap.Unpacker.csproj
+  BUILD_CONFIG: Release
+
+jobs:
+  get-info:
+    name: Get version & metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+      shorthash: ${{ steps.meta.outputs.shorthash }}
+      date: ${{ steps.meta.outputs.date }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Calculate version
+        id: calc
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          last_tag="$(git describe --tags --abbrev=0 2>/dev/null || echo 'v0.0.0')"
+          echo "Last tag: $last_tag"
+
+          range="${last_tag}..HEAD"
+          commits="$(git log --format=%B $range || true)"
+
+          major=0; minor=0; patch=1
+          if echo "$commits" | grep -qiE 'BREAKING CHANGE|!:|BREAKING-CHANGE'; then major=1; minor=0; patch=0; fi
+          if [ $major -eq 0 ] && echo "$commits" | grep -qiE '^feat(\(|:)|^feat!'; then minor=1; patch=0; fi
+
+          ver="${last_tag#v}"
+          IFS='.' read -r X Y Z <<< "$ver"
+
+          if [ $major -eq 1 ]; then X=$((X+1)); Y=0; Z=0;
+          elif [ $minor -eq 1 ]; then Y=$((Y+1)); Z=0;
+          else Z=$((Z+1));
+          fi
+
+          new="${X}.${Y}.${Z}"
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Meta (date & short sha)
+        id: meta
+        run: |
+          echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          echo "shorthash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build ${{ matrix.rid }}
+    needs: get-info
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+            pack: zip
+          - os: ubuntu-latest
+            rid: linux-x64
+            pack: tar
+          - os: macos-13      # Intel runner
+            rid: osx-x64
+            pack: tar
+          - os: macos-latest  # Apple Silicon
+            rid: osx-arm64
+            pack: tar
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+          cache: true
+          cache-dependency-path: |
+            **/*.csproj
+            **/global.json
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build ${{ env.PROJECT }} -c ${{ env.BUILD_CONFIG }} -p:Version=${{ needs.get-info.outputs.version }} --no-restore
+
+      - name: Publish (single-file, self-contained)
+        run: >
+          dotnet publish ${{ env.PROJECT }}
+          -c ${{ env.BUILD_CONFIG }}
+          -r ${{ matrix.rid }}
+          -p:Version=${{ needs.get-info.outputs.version }}
+          -p:PublishSingleFile=true
+          -p:SelfContained=true
+          -p:EnableCompressionInSingleFile=true
+          -p:DebugType=None
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          --no-build
+          -o publish/${{ matrix.rid }}
+
+      - name: Copy registries -> reg
+        run: |
+          mkdir -p publish/${{ matrix.rid }}/reg
+          cp -r registries/* publish/${{ matrix.rid }}/reg/ 2>/dev/null || true
+
+      - name: Detect binary name
+        id: bin
+        shell: bash
+        run: |
+          # pega o primeiro executável gerado dentro da pasta do publish
+          if [[ "${{ matrix.rid }}" == win-* ]]; then
+            file=$(ls publish/${{ matrix.rid }}/*.exe | head -n1)
+          else
+            file=$(find publish/${{ matrix.rid }} -maxdepth 1 -type f -perm -111 | head -n1)
+          fi
+          echo "path=$file" >> $GITHUB_OUTPUT
+          echo "name=$(basename "$file")" >> $GITHUB_OUTPUT
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          cd publish/${{ matrix.rid }}
+          base="ReCap.Unpacker-${{ needs.get-info.outputs.version }}-${{ matrix.rid }}"
+          if [ "${{ matrix.pack }}" = "zip" ]; then
+            7z a "../${base}.zip" .
+          else
+            tar -czf "../${base}.tar.gz" .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReCap.Unpacker-${{ needs.get-info.outputs.version }}-${{ matrix.rid }}
+          path: |
+            publish/${{ matrix.rid }}/*.zip
+            publish/${{ matrix.rid }}/*.tar.gz
+          if-no-files-found: error
+          compression-level: 9
+
+  release:
+    name: Create tag & GitHub Release
+    needs: [get-info, build]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create git tag if missing
+        shell: bash
+        run: |
+          tag="v${{ needs.get-info.outputs.version }}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "Tag $tag já existe."
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "Release $tag"
+            git push origin "$tag"
+          fi
+
+      - name: Zip per platform (if needed)
+        shell: bash
+        run: |
+          cd artifacts
+          for d in */; do
+            (cd "$d" && for f in *; do echo "$PWD/$d$f"; done)
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.get-info.outputs.version }}
+          name: ReCap.Unpacker v${{ needs.get-info.outputs.version }}
+          generate_release_notes: true
+          files: |
+            artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
