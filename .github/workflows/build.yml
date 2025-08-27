@@ -100,7 +100,13 @@ jobs:
         run: |
           cd "publish/${{ matrix.rid }}"
           base="ReCap.Unpacker-${{ needs.get-info.outputs.version }}-${{ matrix.rid }}"
-          tar -czf "./${base}.tar.gz" .
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            tar --sort=name --owner=0 --group=0 --numeric-owner \
+                --mtime='UTC 2020-01-01' -czf "../${base}.tar.gz" .
+          else
+            tar -czf "../${base}.tar.gz" .
+          fi
+          mv "../${base}.tar.gz" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
